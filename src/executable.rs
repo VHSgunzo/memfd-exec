@@ -10,7 +10,7 @@ use std::{
     ffi::{CStr, CString, OsStr, OsString},
     io::{Error, ErrorKind, Result},
     mem::MaybeUninit,
-    os::unix::prelude::{OsStrExt, OsStringExt},
+    os::{fd::AsRawFd, unix::prelude::{OsStrExt, OsStringExt}},
     path::Path,
     ptr::null_mut,
 };
@@ -557,7 +557,7 @@ impl<'a> MemFdExecutable<'a> {
         )
         .unwrap();
 
-        if let Ok(n) = write(mfd, self.code) {
+        if let Ok(n) = write(&mfd, self.code) {
             if n != self.code.len() {
                 return Err(Error::new(
                     ErrorKind::BrokenPipe,
@@ -578,11 +578,12 @@ impl<'a> MemFdExecutable<'a> {
 
         let envp = maybe_envp.iter().map(|s| s.as_c_str()).collect::<Vec<_>>();
 
-        let res = fexecve(mfd, &argv, &envp);
+        let mfd_raw = mfd.as_raw_fd();
+        let res = fexecve(mfd_raw, &argv, &envp);
         if res.is_err() {
             // If we failed to exec, we need to close the memfd
             // so that the child process doesn't leak it
-            let _ = close(mfd);
+            let _ = close(mfd_raw);
             return Err(Error::new(ErrorKind::BrokenPipe, res.err().unwrap()));
         }
         Err(Error::last_os_error())
