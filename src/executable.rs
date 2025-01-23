@@ -538,12 +538,22 @@ impl<'a> MemFdExecutable<'a> {
             }
         }
 
+        // TODO: add detect for qemu emulator
+        fn is_running_in_qemu() -> bool {
+            true
+        }
+        let memfd_flags = if is_running_in_qemu() {
+            MemFdCreateFlag::empty()
+        } else {
+            MemFdCreateFlag::MFD_CLOEXEC
+        };
+
         // TODO: Env resetting isn't implemented because we're using fexecve not execvp
 
         // Map the executable last, because it's a huge hit to memory if something else failed
         let mfd = memfd_create(
-            CString::new("rust_exec").unwrap().as_c_str(),
-            MemFdCreateFlag::MFD_CLOEXEC,
+            CString::new("exec").unwrap().as_c_str(),
+            memfd_flags,
         )
         .unwrap();
 
@@ -568,11 +578,12 @@ impl<'a> MemFdExecutable<'a> {
 
         let envp = maybe_envp.iter().map(|s| s.as_c_str()).collect::<Vec<_>>();
 
-        if let Err(err) = fexecve(mfd, &argv, &envp) {
+        let res = fexecve(mfd, &argv, &envp);
+        if res.is_err() {
             // If we failed to exec, we need to close the memfd
             // so that the child process doesn't leak it
             let _ = close(mfd);
-            return Err(Error::new(ErrorKind::BrokenPipe, err));
+            return Err(Error::new(ErrorKind::BrokenPipe, res.err().unwrap()));
         }
         Err(Error::last_os_error())
     }
