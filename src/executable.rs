@@ -9,19 +9,18 @@ use std::{
     env,
     mem::MaybeUninit,
     collections::BTreeMap,
-    os::{fd::{AsFd, AsRawFd},
     io::{Error, ErrorKind, Result},
     path::Path, process, ptr::null_mut,
     ffi::{CStr, CString, OsStr, OsString},
     fs::{self, create_dir_all, set_permissions, Permissions},
-    unix::{fs::PermissionsExt, prelude::{OsStrExt, OsStringExt}}},
+    os::{unix::{fs::PermissionsExt, prelude::{OsStrExt, OsStringExt}}, fd::{AsFd, AsRawFd}},
 };
 
 use libc::{close, pid_t, sigemptyset, signal};
 use nix::{
     errno::Errno,
     fcntl::{open, OFlag},
-    unistd::{access, fexecve, write, AccessFlags}
+    unistd::{access, fexecve, write, AccessFlags},
     sys::{memfd::{memfd_create, MemFdCreateFlag}, stat::Mode},
 };
 
