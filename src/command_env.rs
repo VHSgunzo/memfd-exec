@@ -96,7 +96,7 @@ impl<'a> Iterator for CommandEnvs<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for CommandEnvs<'a> {
+impl ExactSizeIterator for CommandEnvs<'_> {
     fn len(&self) -> usize {
         self.iter.len()
     }

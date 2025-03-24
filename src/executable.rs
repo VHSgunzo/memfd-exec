@@ -6,19 +6,23 @@
 //! for external use to provide a very similar interface to process::Command for in-memory executables
 
 use std::{
-    collections::BTreeMap,
-    ffi::{CStr, CString, OsStr, OsString},
-    io::{Error, ErrorKind, Result},
+    env,
     mem::MaybeUninit,
-    os::{fd::AsRawFd, unix::prelude::{OsStrExt, OsStringExt}},
-    path::Path,
-    ptr::null_mut,
+    collections::BTreeMap,
+    os::{fd::{AsFd, AsRawFd},
+    io::{Error, ErrorKind, Result},
+    path::Path, process, ptr::null_mut,
+    ffi::{CStr, CString, OsStr, OsString},
+    fs::{self, create_dir_all, set_permissions, Permissions},
+    unix::{fs::PermissionsExt, prelude::{OsStrExt, OsStringExt}}},
 };
 
-use libc::{pid_t, sigemptyset, signal};
+use libc::{close, pid_t, sigemptyset, signal};
 use nix::{
-    sys::memfd::{memfd_create, MemFdCreateFlag},
-    unistd::{close, fexecve, write},
+    errno::Errno,
+    fcntl::{open, OFlag},
+    unistd::{access, fexecve, write, AccessFlags}
+    sys::{memfd::{memfd_create, MemFdCreateFlag}, stat::Mode},
 };
 
 use crate::{
@@ -73,6 +77,8 @@ pub struct MemFdExecutable<'a> {
     /// using the `include_bytes!()` macro, or you can do fancy things like read it in from
     /// a socket.
     code: &'a [u8],
+    /// The name of the program
+    name: String,
     /// The name of the program, this value is the argv\[0\] argument to the binary when
     /// executed. If the program expects something specific here, that value should be
     /// used, otherwise any name will do
@@ -152,12 +158,13 @@ impl<'a> MemFdExecutable<'a> {
     ///
     pub fn new<S: AsRef<OsStr>>(name: S, code: &'a [u8]) -> Self {
         let mut saw_nul = false;
-        let name = os2c(name.as_ref(), &mut saw_nul);
+        let name_cstr = os2c(name.as_ref(), &mut saw_nul);
         Self {
             code,
-            program: name.clone(),
-            args: vec![name.clone()],
-            argv: Argv(vec![name]),
+            name: name.as_ref().to_str().unwrap().to_string(),
+            program: name_cstr.clone(),
+            args: vec![name_cstr.clone()],
+            argv: Argv(vec![name_cstr]),
             env: Default::default(),
             cwd: None,
             stdin: None,
@@ -495,6 +502,20 @@ impl<'a> MemFdExecutable<'a> {
         self.program.to_bytes().contains(&b'/')
     }
 
+    fn write_prog<Fd: AsFd>(&self, fd: &Fd) -> Result<()> {
+        if let Ok(n) = write(fd, self.code) {
+            if n != self.code.len() {
+                return Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "Failed to write to memfd",
+                ));
+            }
+        } else {
+            return Err(Error::last_os_error());
+        }
+        Ok(())
+    }
+
     unsafe fn do_exec(
         &mut self,
         stdio: ChildPipes,
@@ -538,6 +559,26 @@ impl<'a> MemFdExecutable<'a> {
             }
         }
 
+        fn do_fexecve(fd: i32, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
+            let res = fexecve(fd, argv, envp);
+            if res.is_err() {
+                // If we failed to exec, we need to close the memfd
+                // so that the child process doesn't leak it
+                unsafe { close(fd) };
+                return Err(Error::new(ErrorKind::BrokenPipe, res.err().unwrap()));
+            }
+            Ok(())
+        }
+
+        fn is_exe(path: &str) -> bool {
+            if let Ok(metadata) = fs::metadata(path) {
+                return metadata.is_file()
+                    && metadata.permissions().mode() & 0o111 != 0
+                    && access(path, AccessFlags::X_OK).is_ok()
+            }
+            false
+        }
+
         // TODO: add detect for qemu emulator
         fn is_running_in_qemu() -> bool {
             true
@@ -551,22 +592,10 @@ impl<'a> MemFdExecutable<'a> {
         // TODO: Env resetting isn't implemented because we're using fexecve not execvp
 
         // Map the executable last, because it's a huge hit to memory if something else failed
-        let mfd = memfd_create(
-            CString::new("exec").unwrap().as_c_str(),
+        let mut mfd_res = memfd_create(
+            CString::new(&*self.name).unwrap().as_c_str(),
             memfd_flags,
-        )
-        .unwrap();
-
-        if let Ok(n) = write(&mfd, self.code) {
-            if n != self.code.len() {
-                return Err(Error::new(
-                    ErrorKind::BrokenPipe,
-                    "Failed to write to memfd",
-                ));
-            }
-        } else {
-            return Err(Error::last_os_error());
-        }
+        );
 
         let argv = self
             .get_argv()
@@ -578,14 +607,61 @@ impl<'a> MemFdExecutable<'a> {
 
         let envp = maybe_envp.iter().map(|s| s.as_c_str()).collect::<Vec<_>>();
 
-        let mfd_raw = mfd.as_raw_fd();
-        let res = fexecve(mfd_raw, &argv, &envp);
-        if res.is_err() {
-            // If we failed to exec, we need to close the memfd
-            // so that the child process doesn't leak it
-            let _ = close(mfd_raw);
-            return Err(Error::new(ErrorKind::BrokenPipe, res.err().unwrap()));
+        if let Ok(mfd) = &mfd_res {
+            let mfd_raw = mfd.as_raw_fd();
+            if !is_exe(&format!("/proc/self/fd/{}", &mfd_raw)) {
+                close(mfd_raw);
+                mfd_res = Err(Errno::EACCES)
+            }
         }
-        Err(Error::last_os_error())
+        match mfd_res {
+            Ok(mfd) => {
+                self.write_prog(&mfd)?;
+                do_fexecve(mfd.as_raw_fd(), &argv, &envp)
+            }
+            Err(err) => {
+                let pid = process::id();
+                let uid = unsafe { libc::getuid() };
+
+                eprint!("Failed to create memfd: {err}. Trying tmpfile in ");
+                #[allow(deprecated)]
+                for dir in [
+                    env::temp_dir().to_str().unwrap_or_default(),
+                    "/dev/shm",
+                    &format!("{}/.cache", env::home_dir().unwrap_or_default().to_string_lossy())
+                ] {
+                    eprint!("{dir}... ");
+
+                    let path_dir = &format!("{dir}/mfd{uid}{pid}");
+                    create_dir_all(path_dir)?;
+                    set_permissions(path_dir, Permissions::from_mode(0o700))?;
+
+                    let path = &format!("{path_dir}/{}", &self.name);
+                    let file = fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .truncate(true)
+                        .create(true)
+                        .open(path)?;
+                    let fd_raw = file.as_raw_fd();
+
+                    set_permissions(path, Permissions::from_mode(0o700))?;
+                    if !is_exe(path) {
+                        close(fd_raw);
+                        fs::remove_file(path)?;
+                        continue
+                    }
+                    eprintln!();
+
+                    self.write_prog(&file)?;
+                    close(fd_raw);
+
+                    let fd_raw = open(Path::new(&path), OFlag::O_RDONLY, Mode::empty())?;
+                    let _ = fs::remove_dir_all(path_dir);
+                    return do_fexecve(fd_raw, &argv, &envp)
+                }
+                Ok(())
+            }
+        }
     }
 }

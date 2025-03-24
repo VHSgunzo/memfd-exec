@@ -139,7 +139,7 @@ impl FileDesc {
     }
 }
 
-impl<'a> Read for &'a FileDesc {
+impl Read for &FileDesc {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         (**self).read(buf)
     }
