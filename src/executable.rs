@@ -647,7 +647,7 @@ impl<'a> MemFdExecutable<'a> {
                     set_permissions(path, Permissions::from_mode(0o700))?;
                     if !is_exe(path) {
                         close(fd_raw);
-                        fs::remove_file(path)?;
+                        fs::remove_dir_all(path_dir)?;
                         continue
                     }
                     eprintln!();
