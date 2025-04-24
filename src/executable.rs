@@ -13,9 +13,9 @@ use std::{
     collections::BTreeMap,
     thread::{spawn, sleep},
     io::{Error, ErrorKind, Result},
-    path::Path, process, ptr::null_mut,
     ffi::{CStr, CString, OsStr, OsString},
-    fs::{self, create_dir_all, set_permissions, Permissions},
+    path::{Path, PathBuf}, process, ptr::null_mut,
+    fs::{self, create_dir_all, set_permissions, File, Permissions},
     os::{unix::{fs::PermissionsExt, prelude::{OsStrExt, OsStringExt}}, fd::{AsFd, AsRawFd}},
 };
 
@@ -135,6 +135,21 @@ fn construct_envp(env: BTreeMap<OsString, OsString>, saw_nul: &mut bool) -> Vec<
     result
 }
 
+fn create_and_open_file(path: &Path) -> Result<(File, i32)> {
+    let path_dir = path.parent().unwrap();
+    create_dir_all(path_dir)?;
+    set_permissions(path_dir, Permissions::from_mode(0o700))?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .truncate(true)
+        .create(true)
+        .open(path)?;
+    let fd_raw = file.as_raw_fd();
+    set_permissions(path, Permissions::from_mode(0o700))?;
+    Ok((file, fd_raw))
+}
+
 fn do_fexecve(fd: i32, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
     let res = fexecve(fd, argv, envp);
     if res.is_err() {
@@ -146,7 +161,7 @@ fn do_fexecve(fd: i32, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
     Ok(())
 }
 
-fn is_exe(path: &str) -> bool {
+fn is_exe(path: &Path) -> bool {
     if let Ok(metadata) = fs::metadata(path) {
         return metadata.is_file()
             && metadata.permissions().mode() & 0o111 != 0
@@ -559,21 +574,12 @@ impl<'a> MemFdExecutable<'a> {
         ] {
             eprint!("{dir}... ");
 
-            let path_dir = &format!("{dir}/mfd{uid}{pid}");
-            create_dir_all(path_dir)?;
-            set_permissions(path_dir, Permissions::from_mode(0o700))?;
+            let path_dir = PathBuf::from(format!("{dir}/mfd{uid}{pid}"));
+            let path = path_dir.join(&self.name);
 
-            let path = &format!("{path_dir}/{}", &self.name);
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(path)?;
-            let fd_raw = file.as_raw_fd();
+            let (file, fd_raw) = create_and_open_file(&path)?;
 
-            set_permissions(path, Permissions::from_mode(0o700))?;
-            if !is_exe(path) {
+            if !is_exe(&path) {
                 unsafe { close(fd_raw) };
                 fs::remove_dir_all(path_dir)?;
                 continue
@@ -583,20 +589,27 @@ impl<'a> MemFdExecutable<'a> {
             self.write_prog(&file)?;
             unsafe { close(fd_raw) };
 
-            let fd_raw = open(Path::new(&path), OFlag::O_RDONLY, Mode::empty())?;
-            let _ = fs::remove_dir_all(path_dir);
-            let mut res = do_fexecve(fd_raw, argv, envp);
+            let fd_raw = open(&path, OFlag::O_RDONLY, Mode::empty())?;
+            let _ = fs::remove_dir_all(&path_dir);
+            let res = do_fexecve(fd_raw, argv, envp);
+            
             if res.is_err() {
+                let (file, fd_raw) = create_and_open_file(&path)?;
+
+                self.write_prog(&file)?;
+                unsafe { close(fd_raw) };
+               
                 match unsafe { fork() } {
                     Ok(ForkResult::Parent { child: child_pid }) => {
                         spawn(move || waitpid(child_pid, None) );
-                        let fd_raw = open(Path::new(&path), OFlag::O_RDONLY, Mode::empty())?;
-                        res = do_fexecve(fd_raw, argv, envp)
+                        let fd_raw = open(&path, OFlag::O_RDONLY, Mode::empty())?;
+                        return do_fexecve(fd_raw, argv, envp)
                     }
                     Ok(ForkResult::Child) => {
                         try_setsid();
                         sleep(Duration::from_millis(2));
-                        let _ = fs::remove_dir_all(path_dir);
+                        let _ = fs::remove_dir_all(&path_dir);
+                        exit(0)
                     }
                     Err(err) => {
                         eprintln!("fork error: {err}");
@@ -684,7 +697,7 @@ impl<'a> MemFdExecutable<'a> {
             );
             if let Ok(mfd) = &mfd_res {
                 let mfd_raw = mfd.as_raw_fd();
-                if !is_exe(&format!("/proc/self/fd/{}", &mfd_raw)) {
+                if !is_exe(Path::new(&format!("/proc/self/fd/{}", &mfd_raw))) {
                     close(mfd_raw);
                     mfd_res = Err(Errno::EACCES)
                 }
