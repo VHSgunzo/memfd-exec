@@ -92,8 +92,7 @@ impl ExitStatus {
         #[allow(clippy::useless_conversion)]
         match c_int::try_from(self.0) {
             /* was nonzero */
-            Ok(failure) => Err(Error::new(
-                std::io::ErrorKind::Other,
+            Ok(failure) => Err(Error::other(
                 format!("process exited with status {}", failure),
             )),
             /* was zero, couldn't convert */

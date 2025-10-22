@@ -23,8 +23,8 @@ use libc::{close, pid_t, sigemptyset, signal};
 use nix::{
     errno::Errno,
     fcntl::{open, OFlag},
-    unistd::{access, fexecve, write, fork, setsid, AccessFlags, ForkResult},
-    sys::{memfd::{memfd_create, MemFdCreateFlag}, stat::Mode, wait::waitpid},
+    unistd::{access, fexecve, execve, write, fork, setsid, AccessFlags, ForkResult},
+    sys::{memfd::{memfd_create, MFdFlags}, stat::Mode, wait::waitpid},
 };
 
 use crate::{
@@ -151,11 +151,21 @@ fn create_and_open_file(path: &Path) -> Result<(File, i32)> {
 }
 
 fn do_fexecve(fd: i32, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
-    let res = fexecve(fd, argv, envp);
+    use std::os::unix::io::BorrowedFd;
+    let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let res = fexecve(borrowed_fd, argv, envp);
     if res.is_err() {
         // If we failed to exec, we need to close the memfd
         // so that the child process doesn't leak it
         unsafe { close(fd) };
+        return Err(Error::new(ErrorKind::PermissionDenied, res.err().unwrap()));
+    }
+    Ok(())
+}
+
+fn do_execve(path: &str, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
+    let res = execve(&CString::new(path).unwrap(), argv, envp);
+    if res.is_err() {
         return Err(Error::new(ErrorKind::PermissionDenied, res.err().unwrap()));
     }
     Ok(())
@@ -566,7 +576,6 @@ impl<'a> MemFdExecutable<'a> {
         let pid = process::id();
         let uid = unsafe { libc::getuid() };
 
-        #[allow(deprecated)]
         for dir in [
             env::temp_dir().to_str().unwrap_or_default(),
             "/dev/shm",
@@ -590,6 +599,7 @@ impl<'a> MemFdExecutable<'a> {
             unsafe { close(fd_raw) };
 
             let fd_raw = open(&path, OFlag::O_RDONLY, Mode::empty())?;
+            let fd_raw = fd_raw.as_raw_fd();
             let _ = fs::remove_dir_all(&path_dir);
             let res = do_fexecve(fd_raw, argv, envp);
             
@@ -602,8 +612,7 @@ impl<'a> MemFdExecutable<'a> {
                 match unsafe { fork() } {
                     Ok(ForkResult::Parent { child: child_pid }) => {
                         spawn(move || waitpid(child_pid, None) );
-                        let fd_raw = open(&path, OFlag::O_RDONLY, Mode::empty())?;
-                        return do_fexecve(fd_raw, argv, envp)
+                        return do_execve(&path.as_path().to_string_lossy(), argv, envp)
                     }
                     Ok(ForkResult::Child) => {
                         try_setsid();
@@ -685,9 +694,9 @@ impl<'a> MemFdExecutable<'a> {
                 true
             }
             let memfd_flags = if is_running_in_qemu() {
-                MemFdCreateFlag::empty()
+                MFdFlags::empty()
             } else {
-                MemFdCreateFlag::MFD_CLOEXEC
+                MFdFlags::MFD_CLOEXEC
             };
 
             // Map the executable last, because it's a huge hit to memory if something else failed
@@ -713,7 +722,7 @@ impl<'a> MemFdExecutable<'a> {
                     return res;
                 }
                 Err(err) => {
-                    eprint!("Failed to create memfd: {err}.");
+                    eprint!("Failed to create memfd for exec: {err}.");
                     self.fallback_exec(&argv, &envp)?
                 }
             }

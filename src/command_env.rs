@@ -78,26 +78,3 @@ impl CommandEnv {
         }
     }
 }
-
-#[derive(Debug)]
-pub struct CommandEnvs<'a> {
-    iter: std::collections::btree_map::Iter<'a, OsString, Option<OsString>>,
-}
-
-impl<'a> Iterator for CommandEnvs<'a> {
-    type Item = (&'a OsStr, Option<&'a OsStr>);
-    fn next(&mut self) -> Option<Self::Item> {
-        self.iter
-            .next()
-            .map(|(key, value)| (key.as_ref(), value.as_deref()))
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
-    }
-}
-
-impl ExactSizeIterator for CommandEnvs<'_> {
-    fn len(&self) -> usize {
-        self.iter.len()
-    }
-}
