@@ -22,9 +22,8 @@ use std::{
 use libc::{close, pid_t, sigemptyset, signal};
 use nix::{
     errno::Errno,
-    fcntl::{open, OFlag},
+    sys::{memfd::{memfd_create, MFdFlags}, wait::waitpid},
     unistd::{access, fexecve, execve, write, fork, setsid, AccessFlags, ForkResult},
-    sys::{memfd::{memfd_create, MFdFlags}, stat::Mode, wait::waitpid},
 };
 
 use crate::{
@@ -596,36 +595,26 @@ impl<'a> MemFdExecutable<'a> {
             eprintln!();
 
             self.write_prog(&file)?;
+            drop(file);
             unsafe { close(fd_raw) };
 
-            let fd_raw = open(&path, OFlag::O_RDONLY, Mode::empty())?;
-            let fd_raw = fd_raw.as_raw_fd();
-            let _ = fs::remove_dir_all(&path_dir);
-            let res = do_fexecve(fd_raw, argv, envp);
-            
-            if res.is_err() {
-                let (file, fd_raw) = create_and_open_file(&path)?;
-
-                self.write_prog(&file)?;
-                unsafe { close(fd_raw) };
-               
-                match unsafe { fork() } {
-                    Ok(ForkResult::Parent { child: child_pid }) => {
-                        spawn(move || waitpid(child_pid, None) );
-                        return do_execve(&path.as_path().to_string_lossy(), argv, envp)
-                    }
-                    Ok(ForkResult::Child) => {
-                        try_setsid();
-                        sleep(Duration::from_millis(2));
-                        let _ = fs::remove_dir_all(&path_dir);
-                        exit(0)
-                    }
-                    Err(err) => {
-                        eprintln!("fork error: {err}");
-                    }
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { child: child_pid }) => {
+                    spawn(move || waitpid(child_pid, None) );
+                    return do_execve(&path.as_path().to_string_lossy(), argv, envp)
+                }
+                Ok(ForkResult::Child) => {
+                    try_setsid();
+                    sleep(Duration::from_millis(2));
+                    let _ = fs::remove_dir_all(&path_dir);
+                    exit(0)
+                }
+                Err(err) => {
+                    eprintln!("fork error: {err}");
+                    let _ = fs::remove_dir_all(&path_dir);
+                    return Err(Error::other(format!("fork failed: {}", err)));
                 }
             }
-            return res
         }
         Ok(())
     }
