@@ -111,7 +111,7 @@ unsafe impl Sync for Argv {}
 fn os2c(s: &OsStr, saw_nul: &mut bool) -> CString {
     CString::new(s.as_bytes()).unwrap_or_else(|_e| {
         *saw_nul = true;
-        CString::new("<string-with-nul>").unwrap()
+        CString::new("<string-with-nul>").unwrap_or_default()
     })
 }
 
@@ -135,7 +135,7 @@ fn construct_envp(env: BTreeMap<OsString, OsString>, saw_nul: &mut bool) -> Vec<
 }
 
 fn create_and_open_file(path: &Path) -> Result<(File, i32)> {
-    let path_dir = path.parent().unwrap();
+    let path_dir = path.parent().ok_or(Error::new(ErrorKind::InvalidInput, "path has no parent"))?;
     create_dir_all(path_dir)?;
     set_permissions(path_dir, Permissions::from_mode(0o700))?;
     let file = fs::OpenOptions::new()
@@ -152,22 +152,24 @@ fn create_and_open_file(path: &Path) -> Result<(File, i32)> {
 fn do_fexecve(fd: i32, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
     use std::os::unix::io::BorrowedFd;
     let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
-    let res = fexecve(borrowed_fd, argv, envp);
-    if res.is_err() {
-        // If we failed to exec, we need to close the memfd
-        // so that the child process doesn't leak it
-        unsafe { close(fd) };
-        return Err(Error::new(ErrorKind::PermissionDenied, res.err().unwrap()));
+    match fexecve(borrowed_fd, argv, envp) {
+        Ok(_) => return Ok(()),
+        Err(err) => {
+            // If we failed to exec, we need to close the memfd
+            // so that the child process doesn't leak it
+            unsafe { close(fd) };
+            return Err(Error::new(ErrorKind::PermissionDenied, err));
+        }
     }
-    Ok(())
 }
 
 fn do_execve(path: &str, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
-    let res = execve(&CString::new(path).unwrap(), argv, envp);
-    if res.is_err() {
-        return Err(Error::new(ErrorKind::PermissionDenied, res.err().unwrap()));
+    match execve(&CString::new(path).unwrap_or_default(), argv, envp) {
+        Ok(_) => return Ok(()),
+        Err(err) => {
+            return Err(Error::new(ErrorKind::PermissionDenied, err));
+        }
     }
-    Ok(())
 }
 
 fn is_exe(path: &Path) -> bool {
@@ -214,7 +216,7 @@ impl<'a> MemFdExecutable<'a> {
         let name_cstr = os2c(name.as_ref(), &mut saw_nul);
         Self {
             code,
-            name: name.as_ref().to_str().unwrap().to_string(),
+            name: name.as_ref().to_str().unwrap_or_default().to_string(),
             program: name_cstr.clone(),
             args: vec![name_cstr.clone()],
             argv: Argv(vec![name_cstr]),
@@ -340,7 +342,7 @@ impl<'a> MemFdExecutable<'a> {
     ///
     /// use memfd_exec::{MemFdExecutable, Stdio};
     ///
-    /// let mut cat = MemFdExecutable::new("cat", &read("/bin/cat").unwrap())
+    /// let mut cat = MemFdExecutable::new("cat", &read("/bin/cat").unwrap_or_default())
     ///     .stdin(Stdio::piped())
     ///     .stdout(Stdio::piped())
     ///     .spawn()
@@ -428,7 +430,7 @@ impl<'a> MemFdExecutable<'a> {
                         "Validation on the CLOEXEC pipe failed: {:?}",
                         bytes
                     );
-                    let errno = i32::from_be_bytes(errno.try_into().unwrap());
+                    let errno = i32::from_be_bytes(errno.try_into().unwrap_or_default());
                     assert!(p.wait().is_ok(), "wait() should either return Ok or panic");
                     return Err(Error::from_raw_os_error(errno));
                 }
@@ -576,7 +578,7 @@ impl<'a> MemFdExecutable<'a> {
         let uid = unsafe { libc::getuid() };
 
         for dir in [
-            env::temp_dir().to_str().unwrap_or_default(),
+            env::temp_dir().to_str().unwrap_or("/tmp"),
             "/dev/shm",
             &format!("{}/.cache", env::home_dir().unwrap_or_default().to_string_lossy())
         ] {
@@ -690,7 +692,7 @@ impl<'a> MemFdExecutable<'a> {
 
             // Map the executable last, because it's a huge hit to memory if something else failed
             let mut mfd_res = memfd_create(
-                CString::new(&*self.name).unwrap().as_c_str(),
+                CString::new(&*self.name).unwrap_or_default().as_c_str(),
                 memfd_flags,
             );
             if let Ok(mfd) = &mfd_res {
@@ -719,3 +721,4 @@ impl<'a> MemFdExecutable<'a> {
         Ok(())
     }
 }
+
