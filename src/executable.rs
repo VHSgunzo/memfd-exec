@@ -153,22 +153,20 @@ fn do_fexecve(fd: i32, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
     use std::os::unix::io::BorrowedFd;
     let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
     match fexecve(borrowed_fd, argv, envp) {
-        Ok(_) => return Ok(()),
+        Ok(_) => Ok(()),
         Err(err) => {
             // If we failed to exec, we need to close the memfd
             // so that the child process doesn't leak it
             unsafe { close(fd) };
-            return Err(Error::new(ErrorKind::PermissionDenied, err));
+            Err(Error::new(ErrorKind::PermissionDenied, err))
         }
     }
 }
 
 fn do_execve(path: &str, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
     match execve(&CString::new(path).unwrap_or_default(), argv, envp) {
-        Ok(_) => return Ok(()),
-        Err(err) => {
-            return Err(Error::new(ErrorKind::PermissionDenied, err));
-        }
+        Ok(_) => Ok(()),
+        Err(err) => Err(Error::new(ErrorKind::PermissionDenied, err)),
     }
 }
 
@@ -697,7 +695,7 @@ impl<'a> MemFdExecutable<'a> {
             );
             if let Ok(mfd) = &mfd_res {
                 let mfd_raw = mfd.as_raw_fd();
-                if !is_exe(Path::new(&format!("/proc/self/fd/{}", &mfd_raw))) {
+                if !is_exe(Path::new(&format!("/proc/self/fd/{mfd_raw}"))) {
                     close(mfd_raw);
                     mfd_res = Err(Errno::EACCES)
                 }
