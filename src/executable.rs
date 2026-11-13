@@ -19,7 +19,7 @@ use std::{
     os::{unix::{fs::PermissionsExt, prelude::{OsStrExt, OsStringExt}}, fd::{AsFd, AsRawFd}},
 };
 
-use libc::{close, pid_t, sigemptyset, signal};
+use libc::{pid_t, sigemptyset, signal};
 use nix::{
     errno::Errno,
     sys::{memfd::{memfd_create, MFdFlags}, wait::waitpid},
@@ -134,7 +134,7 @@ fn construct_envp(env: BTreeMap<OsString, OsString>, saw_nul: &mut bool) -> Vec<
     result
 }
 
-fn create_and_open_file(path: &Path) -> Result<(File, i32)> {
+fn create_and_open_file(path: &Path) -> Result<File> {
     let path_dir = path.parent().ok_or(Error::new(ErrorKind::InvalidInput, "path has no parent"))?;
     create_dir_all(path_dir)?;
     set_permissions(path_dir, Permissions::from_mode(0o700))?;
@@ -144,9 +144,8 @@ fn create_and_open_file(path: &Path) -> Result<(File, i32)> {
         .truncate(true)
         .create(true)
         .open(path)?;
-    let fd_raw = file.as_raw_fd();
     set_permissions(path, Permissions::from_mode(0o700))?;
-    Ok((file, fd_raw))
+    Ok(file)
 }
 
 fn do_fexecve(fd: i32, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
@@ -154,12 +153,7 @@ fn do_fexecve(fd: i32, argv: &Vec<&CStr>, envp: &Vec<&CStr>) -> Result<()> {
     let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
     match fexecve(borrowed_fd, argv, envp) {
         Ok(_) => Ok(()),
-        Err(err) => {
-            // If we failed to exec, we need to close the memfd
-            // so that the child process doesn't leak it
-            unsafe { close(fd) };
-            Err(Error::new(ErrorKind::PermissionDenied, err))
-        }
+        Err(err) => Err(Error::new(ErrorKind::PermissionDenied, err)),
     }
 }
 
@@ -585,10 +579,10 @@ impl<'a> MemFdExecutable<'a> {
             let path_dir = PathBuf::from(format!("{dir}/mfd{uid}{pid}"));
             let path = path_dir.join(&self.name);
 
-            let (file, fd_raw) = create_and_open_file(&path)?;
+            let file = create_and_open_file(&path)?;
 
             if !is_exe(&path) {
-                unsafe { close(fd_raw) };
+                drop(file);
                 fs::remove_dir_all(path_dir)?;
                 continue
             }
@@ -596,7 +590,6 @@ impl<'a> MemFdExecutable<'a> {
 
             self.write_prog(&file)?;
             drop(file);
-            unsafe { close(fd_raw) };
 
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { child: child_pid }) => {
@@ -696,7 +689,6 @@ impl<'a> MemFdExecutable<'a> {
             if let Ok(mfd) = &mfd_res {
                 let mfd_raw = mfd.as_raw_fd();
                 if !is_exe(Path::new(&format!("/proc/self/fd/{mfd_raw}"))) {
-                    close(mfd_raw);
                     mfd_res = Err(Errno::EACCES)
                 }
             }
@@ -705,6 +697,7 @@ impl<'a> MemFdExecutable<'a> {
                     self.write_prog(&mfd)?;
                     let mut res = do_fexecve(mfd.as_raw_fd(), &argv, &envp);
                     if res.is_err() {
+                        drop(mfd);
                         eprint!("Failed to exec memfd: {}.", res.unwrap_err());
                         res = self.fallback_exec(&argv, &envp)
                     }

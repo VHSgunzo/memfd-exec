@@ -104,6 +104,23 @@ For testing purposes, you need to install:
 - `clang`
 - `glibc-static`
 - `glibc`
+- `bubblewrap` (`bwrap`), with user/mount namespace support, for `fd_ownership`
+- `cc`, with static libc support, for the tiny `fd_ownership` payload
+
+Run the descriptor-ownership regressions with:
+
+```sh
+cargo test --locked --test fd_ownership -- --nocapture
+```
+
+These tests re-execute the test runner in a private empty root (binding only its
+loader/libraries and payload), with and without `/proc` and `/dev`. They check
+normal memfd execution, the existing on-disk fallback when `/proc` is absent or
+`NO_MEMFDEXEC=1`, a noexec fallback directory, and returned exec errors without
+double-closes or leaked failed-exec memfds (including seccomp-denied descriptor
+exec followed by successful file exec). The fallback policy is unchanged: absent `/proc`
+still selects a temporary file, not direct `execveat` execution. No host mounts
+are modified; the noexec mount belongs only to the bubblewrap sandbox.
 
 You should also have `/bin/cat` and `/bin/ls` on your system. This is default on the
 vast majority of Linux systems, but don't panic if this test fails if they are missing.
