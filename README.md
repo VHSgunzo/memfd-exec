@@ -15,7 +15,7 @@ cases for this may include:
 
 ## Using
 
-Just include `memfd-exec = "0.2.5"` in your `Cargo.toml` file.
+Just include `memfd-exec = { git = "https://github.com/VHSgunzo/memfd-exec.git", tag = "v0.2.7" }` in your `Cargo.toml` file.
 
 ## Features
 
