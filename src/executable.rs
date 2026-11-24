@@ -8,10 +8,9 @@
 use std::{
     env,
     process::exit,
-    time::Duration,
     mem::MaybeUninit,
     collections::BTreeMap,
-    thread::{spawn, sleep},
+    thread::spawn,
     io::{Error, ErrorKind, Result},
     ffi::{CStr, CString, OsStr, OsString},
     path::{Path, PathBuf}, process, ptr::null_mut,
@@ -591,19 +590,43 @@ impl<'a> MemFdExecutable<'a> {
             self.write_prog(&file)?;
             drop(file);
 
+            // The file may only be removed once the parent has exec'd it, and a
+            // fixed delay is not enough on a slow or old machine (the exec then
+            // fails with ENOENT). The parent holds the write end of a pipe that
+            // execve closes (or its death), and the child removes the file at EOF.
+            // pipe + fcntl rather than pipe2, which kernels before 2.6.27 lack.
+            let mut gate = [-1; 2];
+            if unsafe { libc::pipe(gate.as_mut_ptr()) } == -1 {
+                let err = Error::last_os_error();
+                let _ = fs::remove_dir_all(&path_dir);
+                return Err(err);
+            }
+            for fd in gate {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            }
+
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { child: child_pid }) => {
+                    unsafe { libc::close(gate[0]) };
                     spawn(move || waitpid(child_pid, None) );
-                    return do_execve(&path.as_path().to_string_lossy(), argv, envp)
+                    let err = do_execve(&path.as_path().to_string_lossy(), argv, envp);
+                    unsafe { libc::close(gate[1]) };
+                    return err
                 }
                 Ok(ForkResult::Child) => {
+                    unsafe { libc::close(gate[1]) };
                     try_setsid();
-                    sleep(Duration::from_millis(2));
+                    let mut byte = 0u8;
+                    while unsafe { libc::read(gate[0], (&mut byte as *mut u8).cast(), 1) } == -1
+                        && Errno::last() == Errno::EINTR
+                    {}
                     let _ = fs::remove_dir_all(&path_dir);
                     exit(0)
                 }
                 Err(err) => {
                     eprintln!("fork error: {err}");
+                    unsafe { libc::close(gate[0]) };
+                    unsafe { libc::close(gate[1]) };
                     let _ = fs::remove_dir_all(&path_dir);
                     return Err(Error::other(format!("fork failed: {}", err)));
                 }
